@@ -119,8 +119,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 	writeValue := func(writer io.Writer, v interface{}) int64 {
 		rv := reflect.ValueOf(v)
 		structSize := reflect.TypeOf(v).Elem().Size()
-		slice := reflect.SliceHeader{Data: rv.Pointer(), Len: int(structSize), Cap: int(structSize)}
-		byteSlice := *(*[]byte)(unsafe.Pointer(&slice)) //nolint:govet
+		byteSlice := unsafe.Slice((*byte)(rv.UnsafePointer()), int(structSize))
 		err := binary.Write(writer, binary.LittleEndian, byteSlice)
 		common.PanicIfErr(err)
 		return int64(structSize)
@@ -164,6 +163,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 	//		panic(errors.New("unrecognized blob type"))
 	//	}*/
 	// }
+	putBlobSize := order.BlobAttributes.PutBlobSizeInBytes
 	// Initialize the Job Part's Plan header
 	jpph := JobPartPlanHeader{
 		Version:                DataSchemaVersion,
@@ -186,23 +186,25 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 		NumTransfers:           uint32(len(order.Transfers.List)),
 		LogLevel:               order.LogLevel,
 		DstBlobData: JobPartPlanDstBlob{
-			BlobType:                 order.BlobAttributes.BlobType,
-			NoGuessMimeType:          order.BlobAttributes.NoGuessMimeType,
-			ContentTypeLength:        uint16(len(order.BlobAttributes.ContentType)),
-			ContentEncodingLength:    uint16(len(order.BlobAttributes.ContentEncoding)),
-			ContentDispositionLength: uint16(len(order.BlobAttributes.ContentDisposition)),
-			ContentLanguageLength:    uint16(len(order.BlobAttributes.ContentLanguage)),
-			CacheControlLength:       uint16(len(order.BlobAttributes.CacheControl)),
-			PutMd5:                   order.BlobAttributes.PutMd5, // here because it relates to uploads (blob destination)
-			BlockBlobTier:            order.BlobAttributes.BlockBlobTier,
-			PageBlobTier:             order.BlobAttributes.PageBlobTier,
-			MetadataLength:           uint16(len(order.BlobAttributes.Metadata)),
-			BlockSize:                blockSize,
-			BlobTagsLength:           uint16(len(order.BlobAttributes.BlobTagsString)),
-			CpkInfo:                  order.CpkOptions.CpkInfo,
-			CpkScopeInfoLength:       uint16(len(order.CpkOptions.CpkScopeInfo)),
-			IsSourceEncrypted:        order.CpkOptions.IsSourceEncrypted,
-			SetPropertiesFlags:       order.SetPropertiesFlags,
+			BlobType:                         order.BlobAttributes.BlobType,
+			NoGuessMimeType:                  order.BlobAttributes.NoGuessMimeType,
+			ContentTypeLength:                uint16(len(order.BlobAttributes.ContentType)),
+			ContentEncodingLength:            uint16(len(order.BlobAttributes.ContentEncoding)),
+			ContentDispositionLength:         uint16(len(order.BlobAttributes.ContentDisposition)),
+			ContentLanguageLength:            uint16(len(order.BlobAttributes.ContentLanguage)),
+			CacheControlLength:               uint16(len(order.BlobAttributes.CacheControl)),
+			PutMd5:                           order.BlobAttributes.PutMd5, // here because it relates to uploads (blob destination)
+			BlockBlobTier:                    order.BlobAttributes.BlockBlobTier,
+			PageBlobTier:                     order.BlobAttributes.PageBlobTier,
+			MetadataLength:                   uint16(len(order.BlobAttributes.Metadata)),
+			BlockSize:                        blockSize,
+			PutBlobSize:                      putBlobSize,
+			BlobTagsLength:                   uint16(len(order.BlobAttributes.BlobTagsString)),
+			CpkInfo:                          order.CpkOptions.CpkInfo,
+			CpkScopeInfoLength:               uint16(len(order.CpkOptions.CpkScopeInfo)),
+			IsSourceEncrypted:                order.CpkOptions.IsSourceEncrypted,
+			SetPropertiesFlags:               order.SetPropertiesFlags,
+			DeleteDestinationFileIfNecessary: order.BlobAttributes.DeleteDestinationFileIfNecessary,
 		},
 		DstLocalData: JobPartPlanDstLocal{
 			PreserveLastModifiedTime: order.BlobAttributes.PreserveLastModifiedTime,
@@ -216,7 +218,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 		S2SSourceChangeValidation:      order.S2SSourceChangeValidation,
 		S2SInvalidMetadataHandleOption: order.S2SInvalidMetadataHandleOption,
 		DestLengthValidation:           order.DestLengthValidation,
-		BlobFSRecursiveDelete: 			order.BlobFSRecursiveDelete,
+		BlobFSRecursiveDelete:          order.BlobFSRecursiveDelete,
 		atomicJobStatus:                common.EJobStatus.InProgress(), // We default to InProgress
 		DeleteSnapshotsOption:          order.BlobAttributes.DeleteSnapshotsOption,
 		PermanentDeleteOption:          order.BlobAttributes.PermanentDeleteOption,

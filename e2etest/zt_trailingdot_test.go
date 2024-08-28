@@ -23,7 +23,6 @@ package e2etest
 import (
 	"context"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-file-go/azfile"
 	"runtime"
 	"testing"
 )
@@ -60,7 +59,7 @@ func TestTrailingDot_LocalManual(t *testing.T) {
 	}
 	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.Other(common.EFromTo.FileLocal(), common.EFromTo.LocalFile()), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
-			recursive: true,
+			recursive:   true,
 			trailingDot: common.ETrailingDotOption.Enable(),
 		}, nil,
 		testFiles{
@@ -82,7 +81,7 @@ func TestTrailingDot_LocalManual(t *testing.T) {
 func TestTrailingDot_Min(t *testing.T) {
 	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.Other(common.EFromTo.FileFile()), eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
-			recursive: true,
+			recursive:   true,
 			trailingDot: common.ETrailingDotOption.Enable(),
 		}, nil,
 		testFiles{
@@ -97,16 +96,16 @@ func TestTrailingDot_Min(t *testing.T) {
 func TestTrailingDot_Disabled(t *testing.T) {
 	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.Other(common.EFromTo.FileFile()), eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
-			recursive: true,
+			recursive:   true,
 			trailingDot: common.ETrailingDotOption.Disable(),
 		}, &hooks{
 			afterValidation: func(h hookHelper) {
-				shareURL := h.GetDestination().(*resourceAzureFileShare).shareURL
-				l, err := shareURL.NewRootDirectoryURL().ListFilesAndDirectoriesSegment(context.Background(), azfile.Marker{}, azfile.ListFilesAndDirectoriesOptions{})
+				shareURL := h.GetDestination().(*resourceAzureFileShare).shareClient
+				l, err := shareURL.NewRootDirectoryClient().NewListFilesAndDirectoriesPager(nil).NextPage(context.Background())
 				if err != nil {
 					panic(err)
 				}
-				if len(l.FileItems) != 1 {
+				if len(l.Segment.Files) != 1 {
 					panic("expected 1 file named `file`")
 				}
 			},
@@ -144,7 +143,7 @@ func TestTrailingDot_FileFile(t *testing.T) {
 
 // This is testing that we do not pass the x-ms-source-allow-trailing-dot when the source is not File.
 func TestTrailingDot_BlobFile(t *testing.T) {
-	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.BlobFile()),  eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
+	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.BlobFile()), eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
 			recursive: true,
 		}, nil,
@@ -153,13 +152,13 @@ func TestTrailingDot_BlobFile(t *testing.T) {
 			shouldTransfer: []interface{}{
 				f("file."),
 			},
-			objectTarget: "file.",
+			objectTarget: objectTarget{objectName: "file."},
 		}, EAccountType.Standard(), EAccountType.Standard(), "")
 }
 
 // This is testing that we do not pass the x-ms-source-allow-trailing-dot when the source is not File.
 func TestTrailingDot_BlobFileHNS(t *testing.T) {
-	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.BlobFile()),  eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
+	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.BlobFile()), eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
 			recursive: true,
 		}, nil,
@@ -168,13 +167,13 @@ func TestTrailingDot_BlobFileHNS(t *testing.T) {
 			shouldTransfer: []interface{}{
 				f("file."),
 			},
-			objectTarget: "file.",
+			objectTarget: objectTarget{objectName: "file."},
 		}, EAccountType.Standard(), EAccountType.HierarchicalNamespaceEnabled(), "")
 }
 
 // This is testing that we skip trailing dot files from File to Blob.
 func TestTrailingDot_FileBlob(t *testing.T) {
-	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.FileBlob()),  eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
+	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.FileBlob()), eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
 			recursive: true,
 		}, nil,
@@ -196,7 +195,7 @@ func TestTrailingDot_FileBlob(t *testing.T) {
 
 // This is testing that we skip trailing dot files from File to BlobFS.
 func TestTrailingDot_FileBlobHNS(t *testing.T) {
-	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.FileBlobFS()),  eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
+	RunScenarios(t, eOperation.Copy(), eTestFromTo.Other(common.EFromTo.FileBlobFS()), eValidate.AutoPlusContent(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
 			recursive: true,
 		}, nil,
@@ -256,7 +255,7 @@ func TestTrailingDot_FileLocalWindows(t *testing.T) {
 //			shouldFail: []interface{}{
 //				f("trailingdotfile."),
 //			},
-//			objectTarget: "trailingdotfile.",
+//			objectTarget: objectTarget{objectName: "trailingdotfile.",
 //		}, EAccountType.Standard(), EAccountType.Standard(), "")
 //}
 
@@ -268,7 +267,7 @@ func TestTrailingDot_FileLocalWindowsDisable(t *testing.T) {
 	}
 	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.Other(common.EFromTo.FileLocal()), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly,
 		params{
-			recursive: true,
+			recursive:   true,
 			trailingDot: common.ETrailingDotOption.Disable(),
 		}, nil,
 		testFiles{
@@ -289,7 +288,7 @@ func TestTrailingDot_FileLocalWindowsDisable(t *testing.T) {
 
 func TestTrailingDot_Remove(t *testing.T) {
 	RunScenarios(t, eOperation.Remove(), eTestFromTo.Other(common.EFromTo.FileTrash()), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
-		recursive:          true,
+		recursive: true,
 	}, nil, testFiles{
 		defaultSize: "1K",
 		shouldTransfer: []interface{}{
@@ -302,8 +301,6 @@ func TestTrailingDot_Remove(t *testing.T) {
 			folder("directory"),
 			f("directory/file."),
 			f("directory/file"),
-
-
 		},
 	}, EAccountType.Standard(), EAccountType.Standard(), "")
 }

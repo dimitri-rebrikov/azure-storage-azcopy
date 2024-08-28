@@ -23,7 +23,7 @@ package ste
 import (
 	"bytes"
 	"context"
-	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"io"
 	"net/http"
@@ -46,25 +46,12 @@ type PipelineNetworkStats struct {
 
 func newPipelineNetworkStats(tunerInterface ConcurrencyTuner) *PipelineNetworkStats {
 	s := &PipelineNetworkStats{tunerInterface: tunerInterface}
-	tunerWillCallUs := tunerInterface.RequestCallbackWhenStable(s.start) // we want to start gather stats after the tuner has reached a stable value. No point in gathering them earlier
-	if !tunerWillCallUs {
-		// assume tuner is inactive, and start ourselves now
-		s.start()
-	}
-	return s
-}
-
-// start starts the gathering of stats
-func (s *PipelineNetworkStats) start() {
 	atomic.StoreInt64(&s.atomicStartSeconds, time.Now().Unix())
+	return s
 }
 
 func (s *PipelineNetworkStats) getStartSeconds() int64 {
 	return atomic.LoadInt64(&s.atomicStartSeconds)
-}
-
-func (s *PipelineNetworkStats) IsStarted() bool {
-	return s.getStartSeconds() > 0
 }
 
 func (s *PipelineNetworkStats) recordRetry(responseBody string) {
@@ -79,9 +66,6 @@ func (s *PipelineNetworkStats) recordRetry(responseBody string) {
 
 func (s *PipelineNetworkStats) OperationsPerSecond() int {
 	s.nocopy.Check()
-	if !s.IsStarted() {
-		return 0
-	}
 	elapsed := time.Since(time.Unix(s.getStartSeconds(), 0)).Seconds()
 	if elapsed > 0 {
 		return int(float64(atomic.LoadInt64(&s.atomicOperationCount)) / elapsed)
@@ -159,45 +143,6 @@ func (s *PipelineNetworkStats) AverageE2EMilliseconds() int {
 	}
 }
 
-type xferStatsPolicy struct {
-	next  pipeline.Policy
-	stats *PipelineNetworkStats
-}
-
-// Do accumulates stats for each call
-func (p *xferStatsPolicy) Do(ctx context.Context, request pipeline.Request) (pipeline.Response, error) {
-	start := time.Now()
-
-	resp, err := p.next.Do(ctx, request)
-
-	if p.stats != nil {
-		if p.stats.IsStarted() {
-			atomic.AddInt64(&p.stats.atomicOperationCount, 1)
-			atomic.AddInt64(&p.stats.atomicE2ETotalMilliseconds, int64(time.Since(start).Seconds()*1000))
-
-			if err != nil && !isContextCancelledError(err) {
-				// no response from server
-				atomic.AddInt64(&p.stats.atomicNetworkErrorCount, 1)
-			}
-		}
-
-		// always look at retries, even if not started, because concurrency tuner needs to know about them
-		if resp != nil {
-			// TODO should we also count status 500?  It is mentioned here as timeout:https://docs.microsoft.com/en-us/azure/storage/common/storage-scalability-targets
-			if rr := resp.Response(); rr != nil && rr.StatusCode == http.StatusServiceUnavailable {
-				p.stats.tunerInterface.recordRetry() // always tell the tuner
-				if p.stats.IsStarted() {             // but only count it here, if we have started
-					// To find out why the server was busy we need to look at the response
-					responseBodyText := transparentlyReadBody(rr)
-					p.stats.recordRetry(responseBodyText)
-				}
-			}
-		}
-	}
-
-	return resp, err
-}
-
 // transparentlyReadBody reads the response body, and then (because body is read-once-only) replaces it with
 // a new body that will return the same content to anyone else who reads it.
 // This looks like a fairly common approach in Go, e.g. https://stackoverflow.com/a/23077519
@@ -213,9 +158,45 @@ func transparentlyReadBody(r *http.Response) string {
 	return string(buf) // copy to string
 }
 
-func newXferStatsPolicyFactory(accumulator *PipelineNetworkStats) pipeline.Factory {
-	return pipeline.FactoryFunc(func(next pipeline.Policy, po *pipeline.PolicyOptions) pipeline.PolicyFunc {
-		r := xferStatsPolicy{next: next, stats: accumulator}
-		return r.Do
-	})
+var pipelineNetworkStatsContextKey = contextKey{"pipelineNetworkStats"}
+
+// withPipelineNetworkStats returns a context that contains a pipeline network stats. The retryNotificationPolicy
+// will then invoke the pipeline network stats object when necessary
+func withPipelineNetworkStats(ctx context.Context, stats *PipelineNetworkStats) context.Context {
+	return context.WithValue(ctx, pipelineNetworkStatsContextKey, stats)
+}
+
+type statsPolicy struct {
+}
+
+func (s statsPolicy) Do(req *policy.Request) (*http.Response, error) {
+	start := time.Now()
+
+	response, err := req.Next()
+	// Grab the notification callback out of the context and, if its there, call it
+	stats, ok := req.Raw().Context().Value(pipelineNetworkStatsContextKey).(*PipelineNetworkStats)
+	if ok && stats != nil {
+		atomic.AddInt64(&stats.atomicOperationCount, 1)
+		atomic.AddInt64(&stats.atomicE2ETotalMilliseconds, int64(time.Since(start).Seconds()*1000))
+
+		if err != nil && !isContextCancelledError(err) {
+			// no response from server
+			atomic.AddInt64(&stats.atomicNetworkErrorCount, 1)
+		}
+
+		// always look at retries, even if not started, because concurrency tuner needs to know about them
+		// TODO should we also count status 500?  It is mentioned here as timeout:https://docs.microsoft.com/en-us/azure/storage/common/storage-scalability-targets
+		if response != nil && response.StatusCode == http.StatusServiceUnavailable {
+			stats.tunerInterface.recordRetry() // always tell the tuner
+			// To find out why the server was busy we need to look at the response
+			responseBodyText := transparentlyReadBody(response)
+			stats.recordRetry(responseBodyText)
+		}
+	}
+
+	return response, err
+}
+
+func newStatsPolicy() policy.Policy {
+	return statsPolicy{}
 }

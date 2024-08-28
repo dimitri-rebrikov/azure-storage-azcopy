@@ -23,7 +23,6 @@ package cmd
 import (
 	"context"
 	"errors"
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"github.com/Azure/azure-storage-azcopy/v10/jobsAdmin"
 	"github.com/Azure/azure-storage-azcopy/v10/ste"
@@ -39,7 +38,7 @@ func setPropertiesEnumerator(cca *CookedCopyCmdArgs) (enumerator *CopyEnumerator
 
 	var srcCredInfo common.CredentialInfo
 
-	if srcCredInfo, _, err = GetCredentialInfoForLocation(ctx, cca.FromTo.From(), cca.Source.Value, cca.Source.SAS, true, cca.CpkOptions); err != nil {
+	if srcCredInfo, _, err = GetCredentialInfoForLocation(ctx, cca.FromTo.From(), cca.Source, true, cca.CpkOptions); err != nil {
 		return nil, err
 	}
 	if cca.FromTo == common.EFromTo.FileNone() && (srcCredInfo.CredentialType == common.ECredentialType.Anonymous() && cca.Source.SAS == "") {
@@ -47,7 +46,7 @@ func setPropertiesEnumerator(cca *CookedCopyCmdArgs) (enumerator *CopyEnumerator
 	}
 
 	// Include-path is handled by ListOfFilesChannel.
-	sourceTraverser, err = InitResourceTraverser(cca.Source, cca.FromTo.From(), &ctx, &cca.credentialInfo, common.ESymlinkHandlingType.Preserve(), cca.ListOfFilesChannel, cca.Recursive, false, cca.IncludeDirectoryStubs, cca.permanentDeleteOption, func(common.EntityType) {}, cca.ListOfVersionIDs, false, common.ESyncHashType.None(), common.EPreservePermissionsOption.None(), azcopyLogVerbosity.ToPipelineLogLevel(), cca.CpkOptions, nil, cca.StripTopDir, cca.trailingDot, nil, nil)
+	sourceTraverser, err = InitResourceTraverser(cca.Source, cca.FromTo.From(), &ctx, &cca.credentialInfo, common.ESymlinkHandlingType.Preserve(), cca.ListOfFilesChannel, cca.Recursive, false, cca.IncludeDirectoryStubs, cca.permanentDeleteOption, func(common.EntityType) {}, cca.ListOfVersionIDs, false, common.ESyncHashType.None(), common.EPreservePermissionsOption.None(), azcopyLogVerbosity, cca.CpkOptions, nil, cca.StripTopDir, cca.trailingDot, nil, cca.excludeContainer, false)
 
 	// report failure to create traverser
 	if err != nil {
@@ -70,10 +69,28 @@ func setPropertiesEnumerator(cca *CookedCopyCmdArgs) (enumerator *CopyEnumerator
 		glcm.Info(message)
 	}
 	if jobsAdmin.JobsAdmin != nil {
-		jobsAdmin.JobsAdmin.LogToJobLog(message, pipeline.LogInfo)
+		jobsAdmin.JobsAdmin.LogToJobLog(message, common.LogInfo)
 	}
 
-	transferScheduler := setPropertiesTransferProcessor(cca, NumOfFilesPerDispatchJobPart, fpo)
+	options := createClientOptions(common.AzcopyCurrentJobLogger, nil)
+	var fileClientOptions any
+	if cca.FromTo.From() == common.ELocation.File() {
+		fileClientOptions = &common.FileClientOptions{AllowTrailingDot: cca.trailingDot == common.ETrailingDotOption.Enable()}
+	}
+
+	targetServiceClient, err := common.GetServiceClientForLocation(
+		cca.FromTo.From(),
+		cca.Source,
+		cca.credentialInfo.CredentialType,
+		cca.credentialInfo.OAuthTokenInfo.TokenCredential,
+		&options,
+		fileClientOptions,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	transferScheduler := setPropertiesTransferProcessor(cca, NumOfFilesPerDispatchJobPart, fpo, targetServiceClient)
 
 	finalize := func() error {
 		jobInitiated, err := transferScheduler.dispatchFinalPart()

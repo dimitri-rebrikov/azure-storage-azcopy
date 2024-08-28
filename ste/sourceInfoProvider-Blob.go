@@ -21,79 +21,46 @@
 package ste
 
 import (
-	"io"
-	"net/url"
-	"strings"
-	"time"
-
-	"github.com/Azure/azure-storage-azcopy/v10/azbfs"
+	"context"
+	"crypto/md5"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"io"
+	"time"
 )
 
 // Source info provider for Azure blob
 type blobSourceInfoProvider struct {
 	defaultRemoteSourceInfoProvider
+	source *blob.Client
+	ctx    context.Context
 }
 
 func (p *blobSourceInfoProvider) IsDFSSource() bool {
 	return p.jptm.FromTo().From() == common.ELocation.BlobFS()
 }
 
-func (p *blobSourceInfoProvider) internalPresignedURL(useHNS bool) (*url.URL, error) {
-	uri, err := p.defaultRemoteSourceInfoProvider.PreSignedSourceURL()
-	if err != nil {
-		return nil, err
-	}
-
-	// This will have no real effect on non-standard endpoints (e.g. emulator, stack), and *may* work, but probably won't.
-	// However, Stack/Emulator don't support HNS, so, this won't get use.
-	bURLParts := azblob.NewBlobURLParts(*uri)
-	if useHNS {
-		bURLParts.Host = strings.Replace(bURLParts.Host, ".blob", ".dfs", 1)
-
-		if bURLParts.BlobName != "" {
-			bURLParts.BlobName = strings.TrimSuffix(bURLParts.BlobName, "/") // BlobFS doesn't handle folders correctly like this.
-		} else {
-			bURLParts.ContainerName += "/" // container level perms MUST have a /
-		}
-	} else {
-		bURLParts.Host = strings.Replace(bURLParts.Host, ".dfs", ".blob", 1)
-	}
-	out := bURLParts.URL()
-
-	return &out, nil
+func (p *blobSourceInfoProvider) PreSignedSourceURL() (string, error) {
+	return p.source.URL(), nil // prefer to return the blob URL; data can be read from either endpoint.
 }
 
-func (p *blobSourceInfoProvider) PreSignedSourceURL() (*url.URL, error) {
-	return p.internalPresignedURL(false) // prefer to return the blob URL; data can be read from either endpoint.
+func (p *blobSourceInfoProvider) RawSource() string {
+	return p.source.URL()
 }
 
 func (p *blobSourceInfoProvider) ReadLink() (string, error) {
-	uri, err := p.internalPresignedURL(false)
+	resp, err := p.source.DownloadStream(p.ctx, &blob.DownloadStreamOptions{
+		CPKInfo:      p.jptm.CpkInfo(),
+		CPKScopeInfo: p.jptm.CpkScopeInfo(),
+	})
 	if err != nil {
 		return "", err
 	}
 
-	pl := p.jptm.SourceProviderPipeline()
-	ctx := p.jptm.Context()
-
-	blobURL := azblob.NewBlockBlobURL(*uri, pl)
-
-	clientProvidedKey := azblob.ClientProvidedKeyOptions{}
-	if p.jptm.IsSourceEncrypted() {
-		clientProvidedKey = common.ToClientProvidedKeyOptions(p.jptm.CpkInfo(), p.jptm.CpkScopeInfo())
-	}
-
-	resp, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, clientProvidedKey)
-	if err != nil {
-		return "", err
-	}
-
-	symlinkBuf, err := io.ReadAll(resp.Body(azblob.RetryReaderOptions{
-		MaxRetryRequests: 5,
-		NotifyFailedRead: common.NewReadLogFunc(p.jptm, uri),
+	symlinkBuf, err := io.ReadAll(resp.NewRetryReader(p.ctx, &blob.RetryReaderOptions{
+		MaxRetries:   5,
+		OnFailedRead: common.NewBlobReadLogFunc(p.jptm, p.jptm.Info().Source),
 	}))
 	if err != nil {
 		return "", err
@@ -108,7 +75,7 @@ func (p *blobSourceInfoProvider) GetUNIXProperties() (common.UnixStatAdapter, er
 		return nil, err
 	}
 
-	return common.ReadStatFromMetadata(prop.SrcMetadata.ToAzBlobMetadata(), p.SourceSize())
+	return common.ReadStatFromMetadata(prop.SrcMetadata, p.SourceSize())
 }
 
 func (p *blobSourceInfoProvider) HasUNIXProperties() bool {
@@ -133,45 +100,98 @@ func newBlobSourceInfoProvider(jptm IJobPartTransferMgr) (ISourceInfoProvider, e
 		return nil, err
 	}
 
-	return &blobSourceInfoProvider{defaultRemoteSourceInfoProvider: *base}, nil
-}
-
-func (p *blobSourceInfoProvider) AccessControl() (azbfs.BlobFSAccessControl, error) {
-	// We can only get access control via HNS, so we MUST switch here.
-	presignedURL, err := p.internalPresignedURL(true)
-	if err != nil {
-		return azbfs.BlobFSAccessControl{}, err
+	var ret = &blobSourceInfoProvider{
+		defaultRemoteSourceInfoProvider: *base,
 	}
 
-	fURL := azbfs.NewFileURL(*presignedURL, p.jptm.SecondarySourceProviderPipeline())
-	return fURL.GetAccessControl(p.jptm.Context())
+	bsc, err := jptm.SrcServiceClient().BlobServiceClient()
+	if err != nil {
+		return nil, err
+	}
+
+	blobClient := bsc.NewContainerClient(jptm.Info().SrcContainer).NewBlobClient(jptm.Info().SrcFilePath)
+
+	if jptm.Info().VersionID != "" {
+		blobClient, err = blobClient.WithVersionID(jptm.Info().VersionID)
+		if err != nil {
+			return nil, err
+		}
+	} else if jptm.Info().SnapshotID != "" {
+		blobClient, err = blobClient.WithSnapshot(jptm.Info().SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ret.source = blobClient
+
+	ctx := jptm.Context()
+	ctx = withPipelineNetworkStats(ctx, nil)
+	ret.ctx = ctx
+
+	return ret, nil
 }
 
-func (p *blobSourceInfoProvider) BlobTier() azblob.AccessTierType {
-	return p.transferInfo.S2SSrcBlobTier
+func (p *blobSourceInfoProvider) AccessControl() (*string, error) {
+	dsc, err := p.jptm.SrcServiceClient().DatalakeServiceClient()
+	if err != nil {
+		return nil, err
+	}
+
+	sourceDatalakeClient := dsc.NewFileSystemClient(p.jptm.Info().SrcContainer).NewFileClient(p.jptm.Info().SrcFilePath)
+
+	resp, err := sourceDatalakeClient.GetAccessControl(p.ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.ACL, nil
 }
 
-func (p *blobSourceInfoProvider) BlobType() azblob.BlobType {
+func (p *blobSourceInfoProvider) BlobTier() *blob.AccessTier {
+	if p.transferInfo.S2SSrcBlobTier == "" {
+		return nil
+	}
+	return to.Ptr(p.transferInfo.S2SSrcBlobTier)
+}
+
+func (p *blobSourceInfoProvider) BlobType() blob.BlobType {
 	return p.transferInfo.SrcBlobType
 }
 
 func (p *blobSourceInfoProvider) GetFreshFileLastModifiedTime() (time.Time, error) {
 	// We can't set a custom LMT on HNS, so it doesn't make sense to swap here.
-	presignedURL, err := p.internalPresignedURL(false)
+	properties, err := p.source.GetProperties(p.ctx, &blob.GetPropertiesOptions{CPKInfo: p.jptm.CpkInfo()})
 	if err != nil {
 		return time.Time{}, err
 	}
+	return common.IffNotNil(properties.LastModified, time.Time{}), nil
+}
 
-	blobURL := azblob.NewBlobURL(*presignedURL, p.jptm.SourceProviderPipeline())
-	clientProvidedKey := azblob.ClientProvidedKeyOptions{}
-	if p.jptm.IsSourceEncrypted() {
-		clientProvidedKey = common.ToClientProvidedKeyOptions(p.jptm.CpkInfo(), p.jptm.CpkScopeInfo())
+func (p *blobSourceInfoProvider) GetMD5(offset, count int64) ([]byte, error) {
+	var rangeGetContentMD5 *bool
+	if count <= common.MaxRangeGetSize {
+		rangeGetContentMD5 = to.Ptr(true)
 	}
-
-	properties, err := blobURL.GetProperties(p.jptm.Context(), azblob.BlobAccessConditions{}, clientProvidedKey)
+	response, err := p.source.DownloadStream(p.ctx,
+		&blob.DownloadStreamOptions{
+			Range:              blob.HTTPRange{Offset: offset, Count: count},
+			RangeGetContentMD5: rangeGetContentMD5,
+			CPKInfo:            p.jptm.CpkInfo(),
+			CPKScopeInfo:       p.jptm.CpkScopeInfo(),
+		})
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
-
-	return properties.LastModified(), nil
+	if response.ContentMD5 != nil && len(response.ContentMD5) > 0 {
+		return response.ContentMD5, nil
+	} else {
+		// compute md5
+		body := response.NewRetryReader(p.ctx, &blob.RetryReaderOptions{MaxRetries: MaxRetryPerDownloadBody})
+		defer body.Close()
+		h := md5.New()
+		if _, err = io.Copy(h, body); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
 }

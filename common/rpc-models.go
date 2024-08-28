@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	datalake "github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/service"
+
 	"github.com/JeffreyRichter/enum/enum"
 )
 
@@ -74,6 +76,15 @@ func (r ResourceString) FullURL() (*url.URL, error) {
 	return u, err
 }
 
+func (r ResourceString) String() (string, error) {
+	u, err := r.FullURL()
+	if err != nil {
+		return "", err
+	} else {
+		return u.String(), nil
+	}
+}
+
 // to be used when the value is assumed to be a local path
 // Using this signals "Yes, I really am ignoring the SAS and ExtraQuery on purpose",
 // and will result in a panic in the case of programmer error of calling this method
@@ -87,6 +98,9 @@ func (r ResourceString) ValueLocal() string {
 
 func (r ResourceString) addParamsToUrl(u *url.URL, sas, extraQuery string) {
 	for _, p := range []string{sas, extraQuery} {
+		// Sanity check: trim ? from the start
+		p = strings.TrimPrefix(p, "?")
+
 		if p == "" {
 			continue
 		}
@@ -131,10 +145,16 @@ type CopyJobPartOrderRequest struct {
 	Fpo                 FolderPropertyOption // passed in from front-end to ensure that front-end and STE agree on the desired behaviour for the job
 	SymlinkHandlingType SymlinkHandlingType
 	// list of blobTypes to exclude.
-	ExcludeBlobType []azblob.BlobType
+	ExcludeBlobType []blob.BlobType
 
-	SourceRoot      ResourceString
-	DestinationRoot ResourceString
+	SourceRoot       ResourceString
+	DestinationRoot  ResourceString
+	SrcServiceClient *ServiceClient
+	DstServiceClient *ServiceClient
+
+	//These clients are required only in S2S transfers from/to datalake
+	SrcDatalakeClient *datalake.Client
+	DstDatalakeClient *datalake.Client
 
 	Transfers      Transfers
 	LogLevel       LogLevel
@@ -152,13 +172,13 @@ type CopyJobPartOrderRequest struct {
 	S2SPreserveBlobTags            bool
 	CpkOptions                     CpkOptions
 	SetPropertiesFlags             SetPropertiesFlags
-	BlobFSRecursiveDelete 		   bool
+	BlobFSRecursiveDelete          bool
 
 	// S2SSourceCredentialType will override CredentialInfo.CredentialType for use on the source.
 	// As a result, CredentialInfo.OAuthTokenInfo may end up being fulfilled even _if_ CredentialInfo.CredentialType is _not_ OAuth.
 	// This may not always be the case (for instance, if we opt to use multiple OAuth tokens). At that point, this will likely be it's own CredentialInfo.
 	S2SSourceCredentialType CredentialType // Only Anonymous and OAuth will really be used in response to this, but S3 and GCP will come along too...
-	FileAttributes FileTransferAttributes
+	FileAttributes          FileTransferAttributes
 }
 
 // CredentialInfo contains essential credential info which need be transited between modules,
@@ -168,7 +188,6 @@ type CredentialInfo struct {
 	OAuthTokenInfo    OAuthTokenInfo
 	S3CredentialInfo  S3CredentialInfo
 	GCPCredentialInfo GCPCredentialInfo
-	SourceBlobToken   azblob.Credential
 }
 
 func (c CredentialInfo) WithType(credentialType CredentialType) CredentialInfo {
@@ -208,24 +227,26 @@ type ListRequest struct {
 
 // This struct represents the optional attribute for blob request header
 type BlobTransferAttributes struct {
-	BlobType                 BlobType              // The type of a blob - BlockBlob, PageBlob, AppendBlob
-	ContentType              string                // The content type specified for the blob.
-	ContentEncoding          string                // Specifies which content encodings have been applied to the blob.
-	ContentLanguage          string                // Specifies the language of the content
-	ContentDisposition       string                // Specifies the content disposition
-	CacheControl             string                // Specifies the cache control header
-	BlockBlobTier            BlockBlobTier         // Specifies the tier to set on the block blobs.
-	PageBlobTier             PageBlobTier          // Specifies the tier to set on the page blobs.
-	Metadata                 string                // User-defined Name-value pairs associated with the blob
-	NoGuessMimeType          bool                  // represents user decision to interpret the content-encoding from source file
-	PreserveLastModifiedTime bool                  // when downloading, tell engine to set file's timestamp to timestamp of blob
-	PutMd5                   bool                  // when uploading, should we create and PUT Content-MD5 hashes
-	MD5ValidationOption      HashValidationOption  // when downloading, how strictly should we validate MD5 hashes?
-	BlockSizeInBytes         int64                 // when uploading/downloading/copying, specify the size of each chunk
-	DeleteSnapshotsOption    DeleteSnapshotsOption // when deleting, specify what to do with the snapshots
-	BlobTagsString           string                // when user explicitly provides blob tags
-	PermanentDeleteOption    PermanentDeleteOption // Permanently deletes soft-deleted snapshots when indicated by user
-	RehydratePriority        RehydratePriorityType // rehydrate priority of blob
+	BlobType                         BlobType              // The type of a blob - BlockBlob, PageBlob, AppendBlob
+	ContentType                      string                // The content type specified for the blob.
+	ContentEncoding                  string                // Specifies which content encodings have been applied to the blob.
+	ContentLanguage                  string                // Specifies the language of the content
+	ContentDisposition               string                // Specifies the content disposition
+	CacheControl                     string                // Specifies the cache control header
+	BlockBlobTier                    BlockBlobTier         // Specifies the tier to set on the block blobs.
+	PageBlobTier                     PageBlobTier          // Specifies the tier to set on the page blobs.
+	Metadata                         string                // User-defined Name-value pairs associated with the blob
+	NoGuessMimeType                  bool                  // represents user decision to interpret the content-encoding from source file
+	PreserveLastModifiedTime         bool                  // when downloading, tell engine to set file's timestamp to timestamp of blob
+	PutMd5                           bool                  // when uploading, should we create and PUT Content-MD5 hashes
+	MD5ValidationOption              HashValidationOption  // when downloading, how strictly should we validate MD5 hashes?
+	BlockSizeInBytes                 int64                 // when uploading/downloading/copying, specify the size of each chunk
+	PutBlobSizeInBytes               int64                 // when uploading, specify the threshold to determine if the blob should be uploaded in a single PUT request
+	DeleteSnapshotsOption            DeleteSnapshotsOption // when deleting, specify what to do with the snapshots
+	BlobTagsString                   string                // when user explicitly provides blob tags
+	PermanentDeleteOption            PermanentDeleteOption // Permanently deletes soft-deleted snapshots when indicated by user
+	RehydratePriority                RehydratePriorityType // rehydrate priority of blob
+	DeleteDestinationFileIfNecessary bool                  // deletes the dst blob if indicated
 }
 
 // This struct represents the optional attribute for file request header
@@ -321,12 +342,14 @@ type ListJobTransfersRequest struct {
 }
 
 type ResumeJobRequest struct {
-	JobID           JobID
-	SourceSAS       string
-	DestinationSAS  string
-	IncludeTransfer map[string]int
-	ExcludeTransfer map[string]int
-	CredentialInfo  CredentialInfo
+	JobID            JobID
+	SourceSAS        string
+	DestinationSAS   string
+	SrcServiceClient *ServiceClient
+	DstServiceClient *ServiceClient
+	IncludeTransfer  map[string]int
+	ExcludeTransfer  map[string]int
+	CredentialInfo   CredentialInfo
 }
 
 // represents the Details and details of a single transfer
@@ -342,6 +365,7 @@ type TransferDetail struct {
 type CancelPauseResumeResponse struct {
 	ErrorMsg              string
 	CancelledPauseResumed bool
+	JobStatus             JobStatus
 }
 
 // represents the list of Details and details of number of transfers

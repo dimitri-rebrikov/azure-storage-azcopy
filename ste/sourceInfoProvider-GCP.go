@@ -2,10 +2,12 @@ package ste
 
 import (
 	gcpUtils "cloud.google.com/go/storage"
+	"context"
+	"crypto/md5"
 	"fmt"
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"golang.org/x/oauth2/google"
+	"io"
 	"os"
 
 	"net/url"
@@ -14,12 +16,13 @@ import (
 
 type gcpSourceInfoProvider struct {
 	jptm         IJobPartTransferMgr
-	transferInfo TransferInfo
+	transferInfo *TransferInfo
 
 	rawSourceURL *url.URL
 
 	gcpClient   *gcpUtils.Client
 	gcpURLParts common.GCPURLParts
+	ctx         context.Context
 }
 
 var gcpClientFactory = common.NewGCPClientFactory()
@@ -38,15 +41,19 @@ func newGCPSourceInfoProvider(jptm IJobPartTransferMgr) (ISourceInfoProvider, er
 		return nil, err
 	}
 
+	ctx := jptm.Context()
+	ctx = withPipelineNetworkStats(ctx, nil)
+	p.ctx = ctx
+
 	p.gcpClient, err = gcpClientFactory.GetGCPClient(
-		p.jptm.Context(),
+		p.ctx,
 		common.CredentialInfo{
 			CredentialType:    common.ECredentialType.GoogleAppCredentials(),
 			GCPCredentialInfo: common.GCPCredentialInfo{},
 		},
 		common.CredentialOpOptions{
-			LogInfo:  func(str string) { p.jptm.Log(pipeline.LogInfo, str) },
-			LogError: func(str string) { p.jptm.Log(pipeline.LogError, str) },
+			LogInfo:  func(str string) { p.jptm.Log(common.LogInfo, str) },
+			LogError: func(str string) { p.jptm.Log(common.LogError, str) },
 			Panic:    func(err error) { panic(err) },
 		})
 	if err != nil {
@@ -60,11 +67,10 @@ func newGCPSourceInfoProvider(jptm IJobPartTransferMgr) (ISourceInfoProvider, er
 	return &p, nil
 }
 
-func (p *gcpSourceInfoProvider) PreSignedSourceURL() (*url.URL, error) {
-
+func (p *gcpSourceInfoProvider) PreSignedSourceURL() (string, error) {
 	conf, err := google.JWTConfigFromJSON(jsonKey)
 	if err != nil {
-		return nil, fmt.Errorf("Could not get config from json key. Error: %v", err)
+		return "", fmt.Errorf("Could not get config from json key. Error: %v", err)
 	}
 	opts := &gcpUtils.SignedURLOptions{
 		Scheme:         gcpUtils.SigningSchemeV4,
@@ -76,15 +82,10 @@ func (p *gcpSourceInfoProvider) PreSignedSourceURL() (*url.URL, error) {
 	u, err := gcpUtils.SignedURL(p.gcpURLParts.BucketName, p.gcpURLParts.ObjectKey, opts)
 
 	if err != nil {
-		return nil, fmt.Errorf("Unable to Generate Signed URL for given GCP Object: %v", err)
+		return "", fmt.Errorf("Unable to Generate Signed URL for given GCP Object: %v", err)
 	}
 
-	parsedURL, err := url.Parse(u)
-	if err != nil {
-		return nil, fmt.Errorf("Unable to parse signed URL: %v", err)
-	}
-
-	return parsedURL, nil
+	return u, nil
 }
 
 func (p *gcpSourceInfoProvider) Properties() (*SrcProperties, error) {
@@ -93,7 +94,7 @@ func (p *gcpSourceInfoProvider) Properties() (*SrcProperties, error) {
 		SrcMetadata:    p.transferInfo.SrcMetadata,
 	}
 	if p.transferInfo.S2SGetPropertiesInBackend {
-		objectInfo, err := p.gcpClient.Bucket(p.gcpURLParts.BucketName).Object(p.gcpURLParts.ObjectKey).Attrs(p.jptm.Context())
+		objectInfo, err := p.gcpClient.Bucket(p.gcpURLParts.BucketName).Object(p.gcpURLParts.ObjectKey).Attrs(p.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -126,8 +127,8 @@ func (p *gcpSourceInfoProvider) handleInvalidMetadataKeys(m common.Metadata) (co
 	switch p.transferInfo.S2SInvalidMetadataHandleOption {
 	case common.EInvalidMetadataHandleOption.ExcludeIfInvalid():
 		retainedMetadata, excludedMetadata, invalidKeyExists := m.ExcludeInvalidKey()
-		if invalidKeyExists && p.jptm.ShouldLog(pipeline.LogWarning) {
-			p.jptm.Log(pipeline.LogWarning,
+		if invalidKeyExists && p.jptm.ShouldLog(common.LogWarning) {
+			p.jptm.Log(common.LogWarning,
 				fmt.Sprintf("METADATAWARNING: For source %q, invalid metadata with keys %s are excluded", p.transferInfo.Source, excludedMetadata.ConcatenatedKeys()))
 		}
 		return retainedMetadata, nil
@@ -156,7 +157,7 @@ func (p *gcpSourceInfoProvider) IsLocal() bool {
 }
 
 func (p *gcpSourceInfoProvider) GetFreshFileLastModifiedTime() (time.Time, error) {
-	objectInfo, err := p.gcpClient.Bucket(p.gcpURLParts.BucketName).Object(p.gcpURLParts.ObjectKey).Attrs(p.jptm.Context())
+	objectInfo, err := p.gcpClient.Bucket(p.gcpURLParts.BucketName).Object(p.gcpURLParts.ObjectKey).Attrs(p.ctx)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -165,4 +166,19 @@ func (p *gcpSourceInfoProvider) GetFreshFileLastModifiedTime() (time.Time, error
 
 func (p *gcpSourceInfoProvider) EntityType() common.EntityType {
 	return common.EEntityType.File() // All folders are virtual in GCP and only files exist.
+}
+
+func (p *gcpSourceInfoProvider) GetMD5(offset, count int64) ([]byte, error) {
+	// gcp does not support getting range md5
+	body, err := p.gcpClient.Bucket(p.gcpURLParts.BucketName).Object(p.gcpURLParts.ObjectKey).NewRangeReader(p.ctx, offset, count)
+	if err != nil {
+		return nil, err
+	}
+	// compute md5
+	defer body.Close() //nolint:staticcheck
+	h := md5.New()
+	if _, err = io.Copy(h, body); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }

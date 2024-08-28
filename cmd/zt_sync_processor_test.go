@@ -28,7 +28,6 @@ import (
 	"testing"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 func TestLocalDeleter(t *testing.T) {
@@ -63,17 +62,17 @@ func TestLocalDeleter(t *testing.T) {
 
 func TestBlobDeleter(t *testing.T) {
 	a := assert.New(t)
-	bsu := getBSU()
+	bsc := getBlobServiceClient()
 	blobName := "extraBlob.pdf"
 
 	// set up the blob to delete
-	containerURL, containerName := createNewContainer(a, bsu)
-	defer deleteContainer(a, containerURL)
-	scenarioHelper{}.generateBlobsFromList(a, containerURL, []string{blobName}, blockBlobDefaultData)
+	cc, containerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, cc)
+	scenarioHelper{}.generateBlobsFromList(a, cc, []string{blobName}, blockBlobDefaultData)
 
 	// validate that the blob exists
-	blobURL := containerURL.NewBlobURL(blobName)
-	_, err := blobURL.GetProperties(context.Background(), azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	bc := cc.NewBlobClient(blobName)
+	_, err := bc.GetProperties(context.Background(), nil)
 	a.Nil(err)
 
 	// construct the cooked input to simulate user input
@@ -84,9 +83,10 @@ func TestBlobDeleter(t *testing.T) {
 		deleteDestination: common.EDeleteDestination.True(),
 		fromTo:            common.EFromTo.LocalBlob(),
 	}
+	sc := common.NewServiceClient(bsc, nil, nil)
 
 	// set up the blob deleter
-	deleter, err := newSyncDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders())
+	deleter, err := newSyncDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders(), sc)
 	a.Nil(err)
 
 	// exercise the deleter
@@ -94,23 +94,23 @@ func TestBlobDeleter(t *testing.T) {
 	a.Nil(err)
 
 	// validate that the blob was deleted
-	_, err = blobURL.GetProperties(context.Background(), azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	_, err = bc.GetProperties(context.Background(),nil)
 	a.NotNil(err)
 }
 
 func TestFileDeleter(t *testing.T) {
 	a := assert.New(t)
-	fsu := getFSU()
+	fsc := getFileServiceClient()
 	fileName := "extraFile.pdf"
 
 	// set up the file to delete
-	shareURL, shareName := createNewAzureShare(a, fsu)
-	defer deleteShare(a, shareURL)
-	scenarioHelper{}.generateAzureFilesFromList(a, shareURL, []string{fileName})
+	shareClient, shareName := createNewShare(a, fsc)
+	defer deleteShare(a, shareClient)
+	scenarioHelper{}.generateShareFilesFromList(a, shareClient, fsc, []string{fileName})
 
 	// validate that the file exists
-	fileURL := shareURL.NewRootDirectoryURL().NewFileURL(fileName)
-	_, err := fileURL.GetProperties(context.Background())
+	fileClient := shareClient.NewRootDirectoryClient().NewFileClient(fileName)
+	_, err := fileClient.GetProperties(context.Background(), nil)
 	a.Nil(err)
 
 	// construct the cooked input to simulate user input
@@ -122,8 +122,9 @@ func TestFileDeleter(t *testing.T) {
 		fromTo:            common.EFromTo.FileFile(),
 	}
 
+	sc := common.NewServiceClient(nil, fsc, nil)
 	// set up the file deleter
-	deleter, err := newSyncDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders())
+	deleter, err := newSyncDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders(), sc)
 	a.Nil(err)
 
 	// exercise the deleter
@@ -131,6 +132,6 @@ func TestFileDeleter(t *testing.T) {
 	a.Nil(err)
 
 	// validate that the file was deleted
-	_, err = fileURL.GetProperties(context.Background())
+	_, err = fileClient.GetProperties(context.Background(), nil)
 	a.NotNil(err)
 }

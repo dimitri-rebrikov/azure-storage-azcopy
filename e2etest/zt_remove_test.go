@@ -21,7 +21,10 @@
 package e2etest
 
 import (
-	"github.com/Azure/azure-storage-file-go/azfile"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-storage-azcopy/v10/cmd"
+	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"testing"
 	"time"
 )
@@ -36,13 +39,14 @@ func TestRemove_IncludeAfter(t *testing.T) {
 		folder("fold1"),
 		f("fold1/fileb"),
 	}
-	RunScenarios(t, eOperation.Remove(), eTestFromTo.AllRemove(), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
+	// these filters aren't supported for blobFS
+	RunScenarios(t, eOperation.Remove(), eTestFromTo.Other(common.EFromTo.BlobTrash(), common.EFromTo.FileTrash()), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
 		recursive: true,
 	}, &hooks{
 		beforeRunJob: func(h hookHelper) {
 			// Pause for a includeAfter time
 			time.Sleep(5 * time.Second)
-			h.GetModifiableParameters().includeAfter = time.Now().Format(azfile.ISO8601)
+			h.GetModifiableParameters().includeAfter = time.Now().Format(cmd.ISO8601)
 			// Pause then re-write all the files, so that their LastWriteTime is different from their creation time
 			// So that when validating, our validation can be sure that the right datetime has ended up in the right
 			// field
@@ -64,5 +68,76 @@ func TestRemove_IncludeAfter(t *testing.T) {
 		// TODO: is that what we really want, or do we want to set write times here?
 		shouldTransfer: recreateFiles,
 		shouldIgnore:   skippedFiles,
+	}, EAccountType.Standard(), EAccountType.Standard(), "")
+}
+
+func TestRemove_WithSnapshotsBlob(t *testing.T) {
+	blobRemove := TestFromTo{
+		desc:      "AllRemove",
+		useAllTos: true,
+		froms: []common.Location{
+			common.ELocation.Blob(),
+		},
+		tos: []common.Location{
+			common.ELocation.Unknown(),
+		},
+	}
+	RunScenarios(t, eOperation.Remove(), blobRemove, eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
+		recursive: true,
+	}, &hooks{
+		beforeRunJob: func(h hookHelper) {
+			blobClient := h.GetSource().(*resourceBlobContainer).containerClient.NewBlobClient("filea")
+			_, err := blobClient.CreateSnapshot(ctx, nil)
+			if err != nil {
+				t.Errorf("error creating snapshot %s", err)
+			}
+		},
+		afterValidation: func(h hookHelper) {
+			blobClient := h.GetSource().(*resourceBlobContainer).containerClient.NewBlobClient("filea")
+			_, err := blobClient.Delete(ctx, &blob.DeleteOptions{DeleteSnapshots: to.Ptr(blob.DeleteSnapshotsOptionTypeInclude)})
+			if err != nil {
+				t.Errorf("error deleting blob %s", err)
+			}
+		},
+	}, testFiles{
+		defaultSize: "1K",
+		shouldSkip: []interface{}{
+			f("filea"),
+		},
+		objectTarget: objectTarget{objectName: "filea"},
+	}, EAccountType.Standard(), EAccountType.Standard(), "")
+}
+
+func TestRemove_SnapshotsBlob(t *testing.T) {
+	blobRemove := TestFromTo{
+		desc:      "AllRemove",
+		useAllTos: true,
+		froms: []common.Location{
+			common.ELocation.Blob(),
+		},
+		tos: []common.Location{
+			common.ELocation.Unknown(),
+		},
+	}
+	RunScenarios(t, eOperation.Remove(), blobRemove, eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
+		recursive: true,
+	}, &hooks{
+		beforeRunJob: func(h hookHelper) {
+			// Snapshot creation will happen in the getParam method
+		},
+		afterValidation: func(h hookHelper) {
+			blobClient := h.GetSource().(*resourceBlobContainer).containerClient.NewBlobClient("filea")
+			_, err := blobClient.Delete(ctx, nil)
+			if err != nil {
+				t.Errorf("error deleting blob %s", err)
+			}
+		},
+	}, testFiles{
+		defaultSize: "1K",
+		shouldTransfer: []interface{}{
+			folder(""),
+			f("filea"),
+		},
+		objectTarget: objectTarget{objectName: "filea", snapshotid: true},
 	}, EAccountType.Standard(), EAccountType.Standard(), "")
 }
